@@ -89,17 +89,17 @@ class TrackHandler:
 class TrackSources:
     def __init__(self, track) -> None:
         sources: list[dict[str, str]] = jsdict_get_safe(track, "sources")
-        self.album_title: str | None = None
+        self.album_name: str | None = None
         self.playlist_name: str | None = None
 
         for source in sources:
             if source["type"] == "album":
-                self.album_title = jsdict_get_safe(source, "album_title")
+                self.album_name = jsdict_get_safe(source, "album_name")
             if source["type"] == "playlist":
                 self.playlist_name = jsdict_get_safe(source, "playlist_name")
 
     def is_from_album(self) -> bool:
-        return self.album_title is not None
+        return self.album_name is not None
 
     def is_from_playlist(self) -> bool:
         return self.playlist_name is not None

@@ -41,7 +41,7 @@ def process_playlist_tracks(playlist_id, playlist_name):
             track_id = track['id']
             track_name = track.get('name', 'Unknown Track')
             track_artist = ", ".join(a.get('name', '') for a in track.get('artists', []) if a.get('name'))
-            album_name = track.get('album', {}).get('name', 'Unknown Album')
+            album_name = track.get('album', {}).get('name', 'Unknown Album') # album 'title' sounds better, but spotify calls this the 'name'
 
             if track_id not in track_index:
                 track_index[track_id] = {
@@ -102,8 +102,12 @@ print("\nPlaylists:")
 for i, playlist in enumerate(playlist_items):
     print(f"{i:2}: {playlist.get('name', 'Unknown Playlist')}")
 
-selected = input("\nEnter comma-separated playlist numbers to include (or 'all'): ").strip().lower()
-if selected == "all":
+selected = input("\nEnter comma-separated playlist numbers to include (or 'all', or press Enter to skip): ").strip().lower()
+
+if selected == "":
+    selected_playlists = []
+    print("Skipping playlist processing.")
+elif selected == "all":
     selected_playlists = playlist_items
 else:
     max_index = len(playlist_items) - 1
@@ -142,8 +146,12 @@ for i, item in enumerate(album_items):
     album = item.get('album', {})
     print(f"{i:2}: {album.get('name', 'Unknown Album')}")
 
-selected = input("\nEnter comma-separated album numbers to include (or 'all'): ").strip().lower()
-if selected == "all":
+selected = input("\nEnter comma-separated album numbers to include (or 'all', or press Enter to skip): ").strip().lower()
+
+if selected == "":
+    selected_albums = []
+    print("Skipping album processing.")
+elif selected == "all":
     selected_albums = album_items
 else:
     max_index = len(album_items) - 1
@@ -159,6 +167,7 @@ else:
         else:
             print(f"Warning: invalid input '{part}', skipping.")
     selected_albums = [p for i, p in enumerate(album_items) if i in selected_indices]
+
 
 for item in selected_albums:
     album = item.get('album')
