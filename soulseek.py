@@ -2,7 +2,10 @@ from argparse import Namespace
 
 
 import argparse
+import logging
 from typing import Any
+from aioslsk.log_utils import MessageFilter
+from aioslsk.network.network import ConnectToPeer
 from aioslsk.transfer.model import Transfer
 import asyncio
 from io import TextIOWrapper
@@ -70,9 +73,12 @@ class TrackHandler:
         remote_path = result.shared_items[0].filename
 
         filename = remote_path.split("\\")[-1]
+        extension = filename.split(".")[-1]
         print(f"Beginning transfer of {filename} from {username}")
         transfer: Transfer = await client.transfers.download(username, remote_path)
-        transfer.local_path = namespace.track_output_path + filename
+        transfer.local_path = (
+            f"{namespace.output_path}{self.track.spotify_id}.{extension}"
+        )
 
         # Nevermind, this causes a crash # Remove search request from client
         # client.searches.remove_request(self.search_request)
@@ -91,11 +97,11 @@ class TrackSources:
             if source["type"] == "playlist":
                 self.playlist_name = jsdict_get_safe(source, "playlist_name")
 
-        def is_from_album(self) -> bool:
-            return self.album_name is not None
+    def is_from_album(self) -> bool:
+        return self.album_title is not None
 
-        def is_from_playlist(self) -> bool:
-            return self.playlist_name is not None
+    def is_from_playlist(self) -> bool:
+        return self.playlist_name is not None
 
 
 # Initialize argument parser
@@ -103,11 +109,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("filenames", nargs="+")
 parser.add_argument("-t", "--request_timeout", nargs="?", default=5)
-parser.add_argument("-o", "--track_output_path", nargs="?", default="output/tracks/")
-parser.add_argument(
-    "-p", "--playlist_output_path", nargs="?", default="output/playlists/"
-)
-parser.add_argument("-a", "--album_output_path", nargs="?", default="output/albums/")
+parser.add_argument("-o", "--output_path", nargs="?", default="output/")
 namespace = parser.parse_args(sys.argv[1:])
 
 files: list[TextIOWrapper] = []
@@ -162,6 +164,15 @@ async def main(
         exit()
 
     client.settings.searches.send.request_timeout = namespace.request_timeout
+
+    class PeerConnectFailureFilter(logging.Filter):
+        def filter(self, record):
+            return not record.getMessage().startswith(
+                "failed to fulfill ConnectToPeer request"
+            )
+
+    logger = logging.getLogger("aioslsk.network.network")
+    logger.addFilter(PeerConnectFailureFilter())
 
     track_handlers: list[TrackHandler] = []
 
