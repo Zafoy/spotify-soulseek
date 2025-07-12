@@ -4,8 +4,6 @@ from argparse import Namespace
 import argparse
 import logging
 from typing import Any
-from aioslsk.log_utils import MessageFilter
-from aioslsk.network.network import ConnectToPeer
 from aioslsk.transfer.model import Transfer
 import asyncio
 from io import TextIOWrapper
@@ -80,9 +78,12 @@ class TrackHandler:
             f"{namespace.output_path}{self.track.spotify_id}.{extension}"
         )
 
-        # Nevermind, this causes a crash # Remove search request from client
-        # client.searches.remove_request(self.search_request)
-        # self.search_request = None
+        while not transfer.is_transfered():
+            await asyncio.sleep(1)
+
+        # Remove search request from client
+        client.searches.remove_request(self.search_request)
+        self.search_request = None
 
 
 class TrackSources:
@@ -163,32 +164,37 @@ async def main(
         print("Unable to connect to SoulSeek.")
         exit()
 
-    client.settings.searches.send.request_timeout = namespace.request_timeout
+    # client.settings.searches.send.request_timeout = namespace.request_timeout
 
-    class PeerConnectFailureFilter(logging.Filter):
-        def filter(self, record):
-            return not record.getMessage().startswith(
-                "failed to fulfill ConnectToPeer request"
-            )
+    def filter(logger, startswith: str):
+        class SpamFilter(logging.Filter):
+            def filter(self, record):
+                return not record.getMessage().startswith(startswith)
 
-    logger = logging.getLogger("aioslsk.network.network")
-    logger.addFilter(PeerConnectFailureFilter())
+        logger = logging.getLogger(logger)
+        logger.addFilter(SpamFilter())
+
+    filter("aioslsk.network.network", "failed to fulfill ConnectToPeer request")
+    filter(
+        "aioslsk.distributed",
+        "connection was not registered with the distributed network",
+    )
 
     track_handlers: list[TrackHandler] = []
 
-    # Make search requests for each track
-    for spotify_id, track_info in tracks.items():
-        track_handlers.append(await TrackHandler.create(spotify_id, track_info))
-        break  # Do only once for testing TODO: Remove
+    async def search():
+        for spotify_id, track_info in tracks.items():
+            track_handler = await TrackHandler.create(spotify_id, track_info)
+            await asyncio.sleep(namespace.request_timeout)
+            track_handlers.append(track_handler)
 
-    # Wait a while for requests to poplulate
-    await asyncio.sleep(namespace.request_timeout)
-
-    for track_handler in track_handlers:
-        await track_handler.download(client)
+    asyncio.create_task(search())
 
     # Prevent app from closing before downloads are finished.
     while True:
+        for track_handler in track_handlers:
+            await track_handler.download(client)
+
         # TODO: Test if all downloads are finished then quit
         await asyncio.sleep(1)
 
