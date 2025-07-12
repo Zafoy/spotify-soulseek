@@ -2,20 +2,16 @@ from argparse import Namespace
 
 
 import argparse
-from aioslsk.transfer.model import Transfer
-from fileinput import filename
 from typing import Any
+from aioslsk.transfer.model import Transfer
 import asyncio
 from io import TextIOWrapper
-import logging
 import os
 import sys
 import json
 from aioslsk.client import SoulSeekClient
-from aioslsk.events import SearchRequestRemovedEvent, SearchResult, SearchResultEvent
-from aioslsk.exceptions import ConnectionReadError, PeerConnectionError
-from aioslsk.log_utils import MessageFilter
-from aioslsk.network.network import ConnectToPeer
+from aioslsk.events import SearchRequest
+from aioslsk.exceptions import ConnectionReadError
 from aioslsk.settings import Settings, CredentialsSettings
 from dotenv import load_dotenv
 
@@ -30,16 +26,88 @@ def getenv_safe(key: str) -> str:
     return var
 
 
+def jsdict_get_safe(dict: dict[Any, Any], key: str) -> Any:
+    value = dict.get(key)
+
+    if value is None:
+        print(f'Input json file is malformed. Unrecognized key: "{key}"')
+        exit()
+
+    return value
+
+
+class Track:
+    def __init__(self, spotify_id, track_info) -> None:
+        self.spotify_id: str = spotify_id
+        self.name: str = jsdict_get_safe(track_info, "name")
+        self.artist: str = jsdict_get_safe(track_info, "artist")
+        self.album_name: str = jsdict_get_safe(track_info, "album")
+        self.sources: TrackSources = TrackSources(track_info)
+
+
+class TrackHandler:
+    def __init__(self, track: Track, search_request: SearchRequest):
+        self.track = track
+        self.search_request = search_request
+
+    @classmethod
+    async def create(cls, spotify_id, track_info):
+        track = Track(spotify_id, track_info)
+
+        query = f"{track.name} {track.album_name} {track.artist}"
+        print(f'Performing search request "{query}"...')
+        search_request = await client.searches.search(query)
+
+        return cls(track, search_request)
+
+    async def download(self, client: SoulSeekClient) -> None:
+        if self.search_request is None:
+            return
+
+        sorted(self.search_request.results, key=lambda result: result.avg_speed)
+        result = self.search_request.results[0]
+        username = result.username
+        remote_path = result.shared_items[0].filename
+
+        filename = remote_path.split("\\")[-1]
+        print(f"Beginning transfer of {filename} from {username}")
+        transfer: Transfer = await client.transfers.download(username, remote_path)
+        transfer.local_path = namespace.track_output_path + filename
+
+        # Nevermind, this causes a crash # Remove search request from client
+        # client.searches.remove_request(self.search_request)
+        # self.search_request = None
+
+
+class TrackSources:
+    def __init__(self, track) -> None:
+        sources: list[dict[str, str]] = jsdict_get_safe(track, "sources")
+        self.album_title: str | None = None
+        self.playlist_name: str | None = None
+
+        for source in sources:
+            if source["type"] == "album":
+                self.album_title = jsdict_get_safe(source, "album_title")
+            if source["type"] == "playlist":
+                self.playlist_name = jsdict_get_safe(source, "playlist_name")
+
+        def is_from_album(self) -> bool:
+            return self.album_name is not None
+
+        def is_from_playlist(self) -> bool:
+            return self.playlist_name is not None
+
+
 # Initialize argument parser
 parser = argparse.ArgumentParser()
 
 parser.add_argument("filenames", nargs="+")
-parser.add_argument("--request_timeout", nargs="?", default=5)
-parser.add_argument("-ot", "--track_output_path", nargs="?", default="output/tracks/")
+parser.add_argument("-t", "--request_timeout", nargs="?", default=5)
+parser.add_argument("-o", "--track_output_path", nargs="?", default="output/tracks/")
 parser.add_argument(
-    "-op", "--playlist_output_path", nargs="?", default="output/playlists/"
+    "-p", "--playlist_output_path", nargs="?", default="output/playlists/"
 )
-parser.add_argument("-oa", "--album_output_path", nargs="?", default="output/albums/")
+parser.add_argument("-a", "--album_output_path", nargs="?", default="output/albums/")
 namespace = parser.parse_args(sys.argv[1:])
 
 files: list[TextIOWrapper] = []
@@ -52,15 +120,16 @@ for f in namespace.filenames:
         exit()
 
 # Get list titles and artists from json data
-albums: list[dict[str, str]] = []
+tracks = dict()
 
 for file in files:
     try:
-        data: list[dict[str, str]] = json.load(file)  # pyright: ignore[reportAny]
+        data: dict = json.load(file)
     except json.JSONDecodeError:
         print(f'"{file.name}" is not a valid json file.')
         exit()
-    albums += data
+    for track_id, track_info in data.items():
+        tracks[track_id] = track_info
 
 # Try to get soulseek credentials from the environment
 load_dotenv()
@@ -78,12 +147,12 @@ settings: Settings = Settings(
 # Create soulseek client
 client: SoulSeekClient = SoulSeekClient(settings)
 
-transfer_requests: list[tuple[str, str]] = []
 
-
-# async block for aioslsk
+# async block because aioslsk is async
 async def main(
-    namespace: Namespace, client: SoulSeekClient, albums: list[dict[str, str]]
+    namespace: Namespace,
+    client: SoulSeekClient,
+    tracks: dict[str, Any],
 ):
     await client.start()
     try:
@@ -94,54 +163,23 @@ async def main(
 
     client.settings.searches.send.request_timeout = namespace.request_timeout
 
-    # Make search requests for each album
-    for album in albums:
-        query = f"{album.get('artist')}#{album.get('title')}"  # Insert a pound symbol to be able to split the artist and song title later in an event. SoulSeek discards the pound sign when performing a search afaik. -Helinos
-        print(
-            f'Performing search request "{album.get("artist")} {album.get("title")}"...'
-        )
-        _search_request = await client.searches.search(query)
+    track_handlers: list[TrackHandler] = []
+
+    # Make search requests for each track
+    for spotify_id, track_info in tracks.items():
+        track_handlers.append(await TrackHandler.create(spotify_id, track_info))
         break  # Do only once for testing TODO: Remove
 
-    # Wait for transfer requests and start transfers
+    # Wait a while for requests to poplulate
+    await asyncio.sleep(namespace.request_timeout)
+
+    for track_handler in track_handlers:
+        await track_handler.download(client)
+
+    # Prevent app from closing before downloads are finished.
     while True:
+        # TODO: Test if all downloads are finished then quit
         await asyncio.sleep(1)
-        if len(transfer_requests) != 0:
-            (username, remote_path) = transfer_requests.pop()
-            print(f"Beginning transfer of {remote_path} from {username}")
-            transfer: Transfer = await client.transfers.download(username, remote_path)
-            filename = remote_path.split("\\")[-1]
-            transfer.local_path = namespace.track_output_path + filename
 
 
-# Soulseek events
-async def search_result_listener(event: SearchResultEvent):
-    None
-
-
-async def search_request_removed_listener(event: SearchRequestRemovedEvent):
-    query = event.query.query
-    (artist, song_title) = query.split("#")
-    query_tuple = (artist, song_title)
-    query_string = f"{artist} {song_title}"
-
-    results = event.query.results
-
-    print(f"{query_string} has finished collecting {len(results)} results.")
-
-    # Sort results by peer's average speed and get the fastest one
-    sorted(results, key=lambda result: result.avg_speed)
-    result = results[0]
-
-    # Start the download in the background
-    for shared_item in result.shared_items:
-        transfer_requests.append(
-            (result.username, shared_item.filename)
-        )  # "filename" is actually the full path to the remote file
-
-
-# Register events
-client.events.register(SearchResultEvent, search_result_listener)
-client.events.register(SearchRequestRemovedEvent, search_request_removed_listener)
-
-asyncio.run(main(namespace, client, albums))
+asyncio.run(main(namespace, client, tracks))
