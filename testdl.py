@@ -5,6 +5,7 @@ import json
 import asyncio
 import logging
 import argparse
+import re
 from typing import Any
 from dotenv import load_dotenv
 from aioslsk.client import SoulSeekClient
@@ -52,92 +53,114 @@ class Track:
     # constructor
     def __init__(self, index: int, spotify_id: str, track_info: dict[str, Any]):
         self.index = index
-        self.spotify_id = spotify_id # will be used to rename downloaded tracks
+        self.spotify_id = spotify_id
         self.name = jsdict_get_safe(track_info, "name")
         self.artist = jsdict_get_safe(track_info, "artist")
         self.label = f"{self.name} - {self.artist}"
 
-    async def process(self, client: SoulSeekClient, output_path: str):
-        max_attempts = 3 # TODO: set this as a parameter
-        for attempt in range(1, max_attempts + 1): # retry loop
-            await update_line(self.index, f"{self.label} 🔍︎ Searching... (attempt {attempt}/{max_attempts})")
-            try:
-                # ATTEMPT TO SEARCH THE TRACK
-                search_request = await client.searches.search(f"{self.name} {self.artist}")
+    # process this track
+    async def process(self, client: SoulSeekClient, output_path: str, search_timeout: int, download_timeout: int):
+        max_attempts = 3
 
-                for _ in range(5): # gives up to 5 seconds for results to arrive
+        # check if file already exists (common extensions)
+        possible_exts = ["mp3", "flac", "m4a", "wav", "ogg"]
+        for ext in possible_exts:
+            existing_path = os.path.join(output_path, f"{self.spotify_id}.{ext}")
+            if os.path.exists(existing_path):
+                await update_line(self.index, f"{self.label} ✅ Already exists")
+                return True
+
+        for _ in range(max_attempts):
+            await update_line(self.index, f"{self.label} 🔍 Searching")
+
+            try:
+                # sanitize query string to remove invalid characters
+                query = f"{self.name} {self.artist}"
+                query = re.sub(r'[\\/:*?"<>|()\[\]]', '', query)
+                query = re.sub(r'\s+', ' ', query).strip()
+
+                # perform search
+                search_request = await client.searches.search(query)
+
+                for _ in range(search_timeout):
                     if search_request.results:
                         break
                     await asyncio.sleep(1)
 
                 results = search_request.results
-                if not results:
-                    await update_line(self.index, f"{self.label} ✖ Not found")
-                    return
-
-                valid = [r for r in results if r.shared_items] # bool whether search results are shared items (downloadable)
+                valid = [r for r in results if r.shared_items]
                 if not valid:
-                    await update_line(self.index, f"{self.label} ✖ No files")
-                    return
+                    await update_line(self.index, f"{self.label} ❌ No files")
+                    return False
 
-                await update_line(self.index, f"{self.label} ⬇️ Downloading... (attempt {attempt})")
+                # sort peers by descending avg speed
+                sorted_peers = sorted(valid, key=lambda r: r.avg_speed or 0, reverse=True)
 
-                # sort peers by descending speed
-                sorted_peers = sorted(valid, key=lambda r: r.avg_speed, reverse=True)
+                # try each peer until one succeeds
+                for peer in sorted_peers:
+                    username = peer.username
+                    remote_path = peer.shared_items[0].filename
+                    ext = remote_path.split(".")[-1]
+                    dest = os.path.join(output_path, f"{self.spotify_id}.{ext}")
 
-                # select peer starting with fastest
-                peer = sorted_peers[(attempt - 1) % len(sorted_peers)] # % len makes sure we wrap around if attempt > peers
-                username = peer.username # TODO: may want to display this
+                    # skip if exact file already exists
+                    if os.path.exists(dest):
+                        await update_line(self.index, f"{self.label} ✅ Already exists")
+                        return True
 
-                # handle name and path to write downloaded file
-                remote_path = peer.shared_items[0].filename
-                ext = remote_path.split(".")[-1] # pull ext so we know how to save
-                dest = os.path.join(output_path, f"{self.spotify_id}.{ext}") # save with spotify id as name
-                
-                # ATTEMPT TO DOWNLOAD THE TRACK
-                try:
-                    transfer: Transfer = await asyncio.wait_for(
-                        client.transfers.download(username, remote_path),
-                        timeout=20 # TODO: set as param?
-                    )
-                    transfer.local_path = dest
+                    await update_line(self.index, f"{self.label} ⬇️  Downloading from {username}")
 
-                    total_wait = 0
-                    while not transfer.is_transfered():
-                        await asyncio.sleep(1)
-                        total_wait += 1
-                        if total_wait > 60:
-                            raise TimeoutError("Download timeout")
+                    try:
+                        transfer: Transfer = await client.transfers.download(username, remote_path)
+                        transfer.local_path = dest
 
-                    await update_line(self.index, f"{self.label} ✓ Done")
-                    return
+                        # wait for file to appear
+                        for _ in range(10):
+                            if os.path.exists(dest):
+                                break
+                            await asyncio.sleep(1)
+                        else:
+                            raise TimeoutError("File did not appear")
 
-                except asyncio.TimeoutError:
-                    await update_line(self.index, f"{self.label} ✖ Timeout")
-                except Exception as e:
-                    await update_line(self.index, f"{self.label} ✖ {type(e).__name__}")
+                        # wait for transfer to complete
+                        total_wait = 0
+                        while not transfer.is_transfered():
+                            await asyncio.sleep(1)
+                            total_wait += 1
+                            if total_wait > download_timeout:
+                                raise TimeoutError("Transfer stalled")
+
+                        await update_line(self.index, f"{self.label} ✅ Done")
+                        return True
+
+                    except Exception as e:
+                        await update_line(self.index, f"{self.label} ⚠️  Failed ({type(e).__name__})")
+                        continue
+
+                await update_line(self.index, f"{self.label} ❌ All peers failed")
+                await asyncio.sleep(2)
 
             except Exception:
-                await update_line(self.index, f"{self.label} ✖ Search failed")
+                await update_line(self.index, f"{self.label} ❌ Search failed")
+                await asyncio.sleep(2)
 
-            await asyncio.sleep(3)  # short delay before retry
-
-        await update_line(self.index, f"{self.label} ✖ Failed after {max_attempts} attempts")
-        # TODO: probably want these failed files to display at end of script
+        await update_line(self.index, f"{self.label} ❌ Failed after {max_attempts} attempts")
+        return False
 
 # script arguments
 def parse_args():
-    parser = argparse.ArgumentParser(description="SoulSeek downloader from json data.")
+    parser = argparse.ArgumentParser(description="SoulSeek downloader from JSON")
     parser.add_argument("filenames", nargs="*", default=["track_index.json"], help="Input JSON files")
     parser.add_argument("-o", "--output_path", default="output/", help="Output directory")
-    parser.add_argument("-d", "--delay", type=int, default=30, help="Delay between tracks (seconds)")
+    parser.add_argument("-c", "--concurrent", type=int, default=2, help="Max concurrent downloads")
+    parser.add_argument("--search-timeout", type=int, default=10, help="Timeout for search (seconds)")
+    parser.add_argument("--download-timeout", type=int, default=60, help="Timeout for download (seconds)")
     return parser.parse_args()
 
-
+# main async entry
 async def main():
-    global total_tracks
+    global total_tracks, tracks
     args = parse_args()
-
     load_dotenv()
     disable_aioslsk_logging()
 
@@ -165,7 +188,7 @@ async def main():
     try:
         await client.login()
     except ConnectionReadError:
-        print("✖ Could not connect to SoulSeek.")
+        print("❌ Could not connect to SoulSeek.")
         sys.exit(1)
 
     # assign each track an index
@@ -175,18 +198,31 @@ async def main():
     for t in tracks:
         print(t.label)
 
-    # process tracks
-    for t in tracks:
-        try:
-            await t.process(client, args.output_path)
-        except Exception:
-            await update_line(t.index, f"{t.label} ✖ Unexpected error") # in case of unhandled error
-        await asyncio.sleep(args.delay)
+    failed = [] # will store failed downloads
 
-    print("\n✓ All downloads complete.")
+    # limit concurrency using semaphore
+    sem = asyncio.Semaphore(args.concurrent)
+
+    # safely run each track
+    async def safe_process(track: Track):
+        async with sem:
+            success = await track.process(client, args.output_path, args.search_timeout, args.download_timeout)
+            if not success:
+                failed.append(track.label)
+
+    # run all tracks concurrently respecting concurrency limit
+    await asyncio.gather(*(safe_process(t) for t in tracks))
+
+    print("\n✅ All downloads attempted.")
+    if failed:
+        print("\n❌ Failed downloads:")
+        for name in failed:
+            print(" -", name)
+
     await client.stop()
 
 # only run main if the file is executed directly
 if __name__ == "__main__":
     total_tracks = 0
+    tracks = []
     asyncio.run(main())
