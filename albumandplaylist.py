@@ -12,6 +12,7 @@ from aioslsk.client import SoulSeekClient
 from aioslsk.settings import Settings, CredentialsSettings
 from aioslsk.transfer.model import Transfer
 from aioslsk.exceptions import ConnectionReadError
+from mutagen import File as MutagenFile
 
 
 def getenv_safe(key: str) -> str:
@@ -21,10 +22,11 @@ def getenv_safe(key: str) -> str:
         sys.exit(1)
     return val
 
-
 def sanitize(text: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]', '', text)
+    return re.sub(r'[\\/:*?"_<>|]', '', text)
 
+def normalize(s: str) -> str:
+    return re.sub(r"[^\w\s]", "", s).lower().strip()
 
 def disable_aioslsk_logging():
     for name in list(logging.root.manager.loggerDict.keys()):
@@ -138,10 +140,10 @@ class Downloader:
                             self.print_result(track, True)
                             return True
                         except Exception as e:
-                            self.log(f"{track.label} ⚠️ Attempt {attempt+1} failed: {type(e).__name__}")
+                            self.log(f"{track.label} ⚠️  Attempt {attempt+1} failed: {type(e).__name__}")
                             break
             if not found_peer:
-                self.log(f"{track.label} ⚠️ Attempt {attempt+1} failed: No match")
+                self.log(f"{track.label} ⚠️  Attempt {attempt+1} failed: No match")
             await asyncio.sleep(1)
         self.print_result(track, False)
         return False
@@ -219,6 +221,23 @@ class Downloader:
             if track.sid not in seen:
                 await self.download_playlist("Incomplete Album Fallback", [track])
 
+def validate_metadata(tracks, outdir, ext):
+    print("\n🔎 Validating metadata...")
+    for track in tracks:
+        filepath = os.path.join(outdir, f"{track.sid}.{ext}")
+        if not os.path.exists(filepath):
+            continue
+        audio = MutagenFile(filepath, easy=True)
+        if not audio:
+            print(f"⚠️  Cannot read metadata: {track.label}")
+            continue
+        title = audio.get("title", [""])[0]
+        album = audio.get("album", [""])[0]
+        if sanitize(normalize(title)) != sanitize(normalize(track.name)):
+            print(f"⚠️  Title mismatch: {track.label}\n     → Expected: '{track.name}'\n     → Found:    '{title}'")
+        if track.album and sanitize(normalize(album)) != sanitize(normalize(track.album)):
+            print(f"⚠️  Album mismatch: {track.label}\n     → Expected: '{track.album}'\n     → Found:    '{album}'")
+
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -272,6 +291,8 @@ async def main():
         await dl.download_album(album, album_tracks[0].artist, album_tracks)
     for pl, pl_tracks in playlist_map.items():
         await dl.download_playlist(pl, pl_tracks)
+
+    validate_metadata(tracks, args.output, args.ext)
 
     await client.stop()
 
